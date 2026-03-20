@@ -15,7 +15,7 @@ from pathlib import Path
 
 import google.generativeai as genai
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyB9yXLrsRs86qr9pFrmaBPPw4NgKO1yrzo")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "XXX")
 genai.configure(api_key=GEMINI_API_KEY)
 
 BASE_DIR   = Path.home() / "migrants_research"
