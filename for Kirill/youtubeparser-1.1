@@ -1,1 +1,406 @@
+import csv
+import json
+import os
+from collections import Counter
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+WORK_DIR = Path("/Users/sanzarajtzanov/Downloads/VKR/2025 год ПРОЕКТЫ/LLM")
+API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+QUERY = '"татарин" (Россия | РФ | Москва) -Канада -США -Европа -эмиграция'
+
+VIDEOS_FILE = WORK_DIR / "vidtat_list.csv"
+COMMENTS_FILE = WORK_DIR / "tat_all_comments.csv"
+STATS_FILE = WORK_DIR / "parser_stats.json"
+
+MAX_QUOTA_PER_DAY = 9500
+
+SEARCH_LIST_COST = 100
+COMMENT_THREADS_LIST_COST = 1
+
+VIDEO_FIELDS = ["video_id", "title", "published_at", "year_group"]
+COMMENT_FIELDS = ["year_group", "video_id", "video_title", "author", "text", "date", "likes"]
+
+
+@dataclass
+class ParserStats:
+    quota_used: int = 0
+    search_requests: int = 0
+    comment_page_requests: int = 0
+    raw_videos_found: int = 0
+    relevant_videos_found: int = 0
+    duplicate_videos_skipped: int = 0
+    new_videos_saved: int = 0
+    videos_already_processed_for_comments: int = 0
+    comment_rows_loaded: int = 0
+    duplicate_comment_rows_loaded: int = 0
+    new_comments_saved: int = 0
+    duplicate_comments_skipped: int = 0
+    videos_with_comments_saved: int = 0
+    videos_without_comments: int = 0
+    videos_disabled_or_deleted: int = 0
+    total_videos_in_catalog: int = 0
+    total_comments_in_file: int = 0
+
+
+class QuotaTracker:
+    def __init__(self, daily_limit: int) -> None:
+        self.daily_limit = daily_limit
+        self.used = 0
+
+    def can_spend(self, cost: int) -> bool:
+        return self.used + cost <= self.daily_limit
+
+    def spend(self, cost: int, reason: str) -> bool:
+        if not self.can_spend(cost):
+            print(
+                f"\n[ВНИМАНИЕ] Квота почти исчерпана: нужно {cost}, "
+                f"доступно {self.daily_limit - self.used}. Остановка перед {reason}."
+            )
+            return False
+        self.used += cost
+        return True
+
+
+def ensure_csv(path: Path, fieldnames: list[str]) -> None:
+    if path.exists():
+        return
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+
+
+def is_relevant(title: str, description: str) -> bool:
+    text_to_check = f"{title} {description}".lower()
+    stop_words = [
+        "канада",
+        "сша",
+        "америка",
+        "европа",
+        "германия",
+        "польша",
+        "релокация",
+        "покинули",
+        "гринкарта",
+        "green card",
+        "виза в сша",
+    ]
+    return not any(word in text_to_check for word in stop_words)
+
+
+def infer_year_group(date_str: str) -> str:
+    return date_str[:4]
+
+
+def load_existing_video_ids() -> set[str]:
+    ensure_csv(VIDEOS_FILE, VIDEO_FIELDS)
+    with VIDEOS_FILE.open("r", encoding="utf-8") as file:
+        return {row["video_id"] for row in csv.DictReader(file) if row.get("video_id")}
+
+
+def load_existing_comment_keys(stats: ParserStats) -> set[tuple[str, str, str, str]]:
+    ensure_csv(COMMENTS_FILE, COMMENT_FIELDS)
+    seen: set[tuple[str, str, str, str]] = set()
+    duplicates = 0
+
+    with COMMENTS_FILE.open("r", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            key = (
+                row.get("video_id", ""),
+                row.get("author", ""),
+                row.get("date", ""),
+                row.get("text", ""),
+            )
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+
+    stats.comment_rows_loaded = len(seen)
+    stats.duplicate_comment_rows_loaded = duplicates
+    return seen
+
+
+def load_processed_video_ids_from_comments() -> set[str]:
+    ensure_csv(COMMENTS_FILE, COMMENT_FIELDS)
+    with COMMENTS_FILE.open("r", encoding="utf-8") as file:
+        return {row["video_id"] for row in csv.DictReader(file) if row.get("video_id")}
+
+
+def append_video_rows(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    with VIDEOS_FILE.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=VIDEO_FIELDS)
+        writer.writerows(rows)
+
+
+def append_comment_rows(rows: list[dict[str, str]]) -> None:
+    if not rows:
+        return
+    with COMMENTS_FILE.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=COMMENT_FIELDS)
+        writer.writerows(rows)
+
+
+def search_videos_for_period(
+    youtube,
+    quota: QuotaTracker,
+    stats: ParserStats,
+    start_date_str: str,
+    end_date_str: str,
+) -> None:
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+    existing_videos = load_existing_video_ids()
+
+    current_date = start_date
+    while current_date < end_date:
+        next_day = current_date + timedelta(days=1)
+        pub_after = current_date.isoformat() + "T00:00:00Z"
+        pub_before = next_day.isoformat() + "T00:00:00Z"
+
+        if not quota.spend(SEARCH_LIST_COST, f"search.list за {current_date}"):
+            return
+
+        print(f"Поиск видео за {current_date}... (Квота: {quota.used}/{quota.daily_limit})")
+
+        try:
+            response = (
+                youtube.search()
+                .list(
+                    q=QUERY,
+                    part="snippet",
+                    type="video",
+                    maxResults=50,
+                    publishedAfter=pub_after,
+                    publishedBefore=pub_before,
+                    regionCode="RU",
+                    relevanceLanguage="ru",
+                )
+                .execute()
+            )
+            stats.search_requests += 1
+
+            new_videos: list[dict[str, str]] = []
+            for item in response.get("items", []):
+                stats.raw_videos_found += 1
+
+                video_id = item["id"]["videoId"]
+                title = item["snippet"]["title"]
+                description = item["snippet"].get("description", "")
+
+                if not is_relevant(title, description):
+                    continue
+
+                stats.relevant_videos_found += 1
+
+                if video_id in existing_videos:
+                    stats.duplicate_videos_skipped += 1
+                    continue
+
+                row = {
+                    "video_id": video_id,
+                    "title": title,
+                    "published_at": item["snippet"]["publishedAt"],
+                    "year_group": infer_year_group(item["snippet"]["publishedAt"]),
+                }
+                new_videos.append(row)
+                existing_videos.add(video_id)
+
+            append_video_rows(new_videos)
+            stats.new_videos_saved += len(new_videos)
+
+        except HttpError as error:
+            print(f"Ошибка API при поиске: {error}")
+            return
+
+        current_date = next_day
+
+
+def download_comments(youtube, quota: QuotaTracker, stats: ParserStats) -> None:
+    ensure_csv(VIDEOS_FILE, VIDEO_FIELDS)
+    existing_comment_keys = load_existing_comment_keys(stats)
+    processed_videos = load_processed_video_ids_from_comments()
+
+    videos_to_process: list[dict[str, str]] = []
+    with VIDEOS_FILE.open("r", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            if row["video_id"] in processed_videos:
+                stats.videos_already_processed_for_comments += 1
+                continue
+            videos_to_process.append(row)
+
+    print(f"\nОсталось обработать видео: {len(videos_to_process)}")
+
+    for video in videos_to_process:
+        print(f"Скачивание комментариев для: {video['title'][:40]}... (Квота: {quota.used}/{quota.daily_limit})")
+
+        try:
+            request = youtube.commentThreads().list(
+                part="snippet",
+                videoId=video["video_id"],
+                maxResults=100,
+                textFormat="plainText",
+            )
+
+            video_comments: list[dict[str, str]] = []
+            has_any_comments = False
+
+            while request:
+                if not quota.spend(COMMENT_THREADS_LIST_COST, f"commentThreads.list для {video['video_id']}"):
+                    return
+
+                response = request.execute()
+                stats.comment_page_requests += 1
+
+                for item in response.get("items", []):
+                    has_any_comments = True
+                    snippet = item["snippet"]["topLevelComment"]["snippet"]
+                    row = {
+                        "year_group": video["year_group"],
+                        "video_id": video["video_id"],
+                        "video_title": video["title"],
+                        "author": snippet.get("authorDisplayName", ""),
+                        "text": snippet.get("textDisplay", ""),
+                        "date": snippet.get("publishedAt", ""),
+                        "likes": str(snippet.get("likeCount", 0)),
+                    }
+                    key = (row["video_id"], row["author"], row["date"], row["text"])
+                    if key in existing_comment_keys:
+                        stats.duplicate_comments_skipped += 1
+                        continue
+                    existing_comment_keys.add(key)
+                    video_comments.append(row)
+
+                if "nextPageToken" in response:
+                    request = youtube.commentThreads().list_next(request, response)
+                else:
+                    break
+
+            if video_comments:
+                append_comment_rows(video_comments)
+                stats.new_comments_saved += len(video_comments)
+                stats.videos_with_comments_saved += 1
+            elif not has_any_comments:
+                marker = {
+                    "year_group": video["year_group"],
+                    "video_id": video["video_id"],
+                    "video_title": video["title"],
+                    "author": "",
+                    "text": "[NO_COMMENTS]",
+                    "date": "",
+                    "likes": "",
+                }
+                key = (marker["video_id"], marker["author"], marker["date"], marker["text"])
+                if key not in existing_comment_keys:
+                    existing_comment_keys.add(key)
+                    append_comment_rows([marker])
+                    stats.new_comments_saved += 1
+                else:
+                    stats.duplicate_comments_skipped += 1
+                stats.videos_without_comments += 1
+
+        except HttpError as error:
+            if error.resp.status in [403, 404]:
+                print(" -> Комментарии отключены или видео удалено.")
+                marker = {
+                    "year_group": video["year_group"],
+                    "video_id": video["video_id"],
+                    "video_title": video["title"],
+                    "author": "",
+                    "text": "[DISABLED/DELETED]",
+                    "date": "",
+                    "likes": "",
+                }
+                key = (marker["video_id"], marker["author"], marker["date"], marker["text"])
+                if key not in existing_comment_keys:
+                    existing_comment_keys.add(key)
+                    append_comment_rows([marker])
+                    stats.new_comments_saved += 1
+                else:
+                    stats.duplicate_comments_skipped += 1
+                stats.videos_disabled_or_deleted += 1
+            else:
+                print(f" -> Ошибка: {error}")
+
+
+def update_totals(stats: ParserStats) -> None:
+    video_ids = load_existing_video_ids()
+    stats.total_videos_in_catalog = len(video_ids)
+
+    ensure_csv(COMMENTS_FILE, COMMENT_FIELDS)
+    with COMMENTS_FILE.open("r", encoding="utf-8") as file:
+        stats.total_comments_in_file = sum(1 for _ in csv.DictReader(file))
+
+
+def save_stats(stats: ParserStats) -> None:
+    update_totals(stats)
+    payload = asdict(stats)
+    payload["videos_by_year"] = videos_by_year()
+    with STATS_FILE.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+
+
+def videos_by_year() -> dict[str, int]:
+    ensure_csv(VIDEOS_FILE, VIDEO_FIELDS)
+    counter: Counter[str] = Counter()
+    with VIDEOS_FILE.open("r", encoding="utf-8") as file:
+        for row in csv.DictReader(file):
+            counter[row["year_group"]] += 1
+    return dict(sorted(counter.items()))
+
+
+def print_summary(stats: ParserStats) -> None:
+    print("\n=== ИТОГИ ===")
+    print(f"Квота использована точно: {stats.quota_used}")
+    print(f"search.list запросов: {stats.search_requests}")
+    print(f"commentThreads.list страниц: {stats.comment_page_requests}")
+    print(f"Найдено видео сыро: {stats.raw_videos_found}")
+    print(f"Найдено релевантных видео: {stats.relevant_videos_found}")
+    print(f"Новых видео сохранено: {stats.new_videos_saved}")
+    print(f"Дубликатов видео пропущено: {stats.duplicate_videos_skipped}")
+    print(f"Всего уникальных видео в каталоге: {stats.total_videos_in_catalog}")
+    print(f"Видео по годам: {videos_by_year()}")
+    print(f"Комментариев сохранено в этом запуске: {stats.new_comments_saved}")
+    print(f"Дубликатов комментариев пропущено: {stats.duplicate_comments_skipped}")
+    print(f"Всего строк в файле комментариев: {stats.total_comments_in_file}")
+    print(f"Статистика сохранена в: {STATS_FILE}")
+
+
+def build_client():
+    if not API_KEY:
+        raise RuntimeError("Не задан YOUTUBE_API_KEY. Установите переменную окружения.")
+    return build("youtube", "v3", developerKey=API_KEY)
+
+
+def main() -> None:
+    os.chdir(WORK_DIR)
+    ensure_csv(VIDEOS_FILE, VIDEO_FIELDS)
+    ensure_csv(COMMENTS_FILE, COMMENT_FIELDS)
+
+    stats = ParserStats()
+    quota = QuotaTracker(daily_limit=MAX_QUOTA_PER_DAY)
+
+    youtube = build_client()
+
+    print("=== ЭТАП 1: ПОИСК ВИДЕО ===")
+    search_videos_for_period(youtube, quota, stats, "2015-02-01", "2015-03-01")
+    search_videos_for_period(youtube, quota, stats, "2025-02-01", "2025-03-01")
+
+    print("\n=== ЭТАП 2: СКАЧИВАНИЕ КОММЕНТАРИЕВ ===")
+    download_comments(youtube, quota, stats)
+
+    stats.quota_used = quota.used
+    save_stats(stats)
+    print_summary(stats)
+
+
+if __name__ == "__main__":
+    main()
 
